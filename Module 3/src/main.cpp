@@ -1,69 +1,49 @@
-
 #include <Arduino.h>
 #include <SPI.h>
-#include <Wire.h>
 #include <mcp_can.h>
-#include <LiquidCrystal_I2C.h>
 #include <avr/io.h>
 #include <stdint.h>
-#include <stdlib.h>
 
-// =====================================================
-// MODULE 3: CENTRAL ECU - ATmega328PB, 16 MHz
-// CAN IDs:
-//   0x100: T1, T2; signed int16, 0.1 degree C, big-endian
-//   0x200: voltage mV, current mA, power mW, big-endian
-// =====================================================
-
-// MCP2515
+// ==================== CAN ====================
 #define CAN_CS 10
 MCP_CAN CAN0(CAN_CS);
 
-// LCD
-LiquidCrystal_I2C lcd(0x27, 16, 2);
+#define CAN_ID_TEMP   0x100
+#define CAN_ID_POWER  0x200
 
-// ---------------- GPIO mapping ----------------
-// Arduino D3 = PD3: buzzer
-// Arduino D4 = PD4: RGB red
-// Arduino D5 = PD5: RGB green
-// Arduino D6 = PD6: RGB blue
-// Arduino D7 = PD7: relay IN
-// Arduino D8 = PB0: mute button, active LOW
-// Arduino D9 = PB1: reset button, active LOW
-//
-// Assumptions:
-// - RGB LED is common cathode.
-// - Relay module is active LOW.
-// - Buttons connect to GND when pressed.
+#define CAN_BITRATE   CAN_500KBPS
+#define CAN_CLOCK     MCP_8MHZ
 
-#define BUZZER_BIT PD3
-#define RGB_R_BIT  PD4
-#define RGB_G_BIT  PD5
-#define RGB_B_BIT  PD6
-#define RELAY_BIT  PD7
+// ==================== GPIO: ATmega328P/PB ====================
+// D3 = PD3: Buzzer
+// D4 = PD4: RGB Red
+// D5 = PD5: RGB Green
+// D6 = PD6: RGB Blue
+// D7 = PD7: Relay IN (assumed active-low)
+// D8 = PB0: Mute button, active-low
+// D9 = PB1: Reset button, active-low
 
-#define MUTE_BIT   PB0
-#define RESET_BIT  PB1
+#define BUZZER_BIT  PD3
+#define RED_BIT     PD4
+#define GREEN_BIT   PD5
+#define BLUE_BIT    PD6
+#define RELAY_BIT   PD7
 
-#define OUTPUT_MASK ((1 << BUZZER_BIT) | \
-                     (1 << RGB_R_BIT)  | \
-                     (1 << RGB_G_BIT)  | \
-                     (1 << RGB_B_BIT)  | \
-                     (1 << RELAY_BIT))
+#define MUTE_BIT    PB0
+#define RESET_BIT   PB1
 
-// ---------------- Thresholds ----------------
-const int16_t TEMP_WARN_X10 = 500;   // 50.0 C
-const int16_t TEMP_CRIT_X10 = 600;   // 60.0 C
+// ==================== THRESHOLDS ====================
+const int16_t TEMP_WARNING_X10 = 500;  // 50.0 C
+const int16_t TEMP_CRITICAL_X10 = 600; // 60.0 C
 
-const int32_t CURRENT_LIMIT_MA = 800;  // 0.8 A
+const int16_t CURRENT_LIMIT_MA = 800;
 const uint16_t VOLTAGE_MIN_MV = 7000;
 const uint16_t VOLTAGE_MAX_MV = 15000;
 
-const unsigned long CAN_TIMEOUT_MS = 2000;
-const unsigned long LCD_UPDATE_MS = 300;
-const unsigned long BLINK_INTERVAL_MS = 250;
+const unsigned long DATA_TIMEOUT_MS = 2000;
+const unsigned long PRINT_INTERVAL_MS = 1000;
 
-// ---------------- Received data ----------------
+// ==================== RECEIVED DATA ====================
 int16_t temp1_x10 = 0;
 int16_t temp2_x10 = 0;
 
@@ -71,388 +51,324 @@ uint16_t voltage_mV = 0;
 int16_t current_mA = 0;
 uint16_t power_mW = 0;
 
-bool haveTempData = false;
-bool havePowerData = false;
+unsigned long lastTempRx = 0;
+unsigned long lastPowerRx = 0;
+unsigned long lastPrint = 0;
 
-unsigned long lastTempMs = 0;
-unsigned long lastPowerMs = 0;
+bool tempDataReceived = false;
+bool powerDataReceived = false;
 
-// ---------------- System state ----------------
-bool faultLatched = true;  // Start safe: relay open until data is valid
-bool muted = false;
-bool lastMuteButton = false;
-bool lastResetButton = false;
+bool faultLatched = true;
+bool buzzerMuted = false;
 
-unsigned long lastLcdMs = 0;
-unsigned long lastBlinkMs = 0;
-bool blinkState = false;
+bool previousMutePressed = false;
+bool previousResetPressed = false;
 
-// =====================================================
-// GPIO helpers - AVR registers
-// =====================================================
+// ==================== GPIO HELPERS ====================
+void gpio_init() {
+    // D3-D7 outputs
+    DDRD |= (1 << BUZZER_BIT) |
+            (1 << RED_BIT) |
+            (1 << GREEN_BIT) |
+            (1 << BLUE_BIT) |
+            (1 << RELAY_BIT);
 
-void gpio_init()
-{
-    // D3-D7 as outputs
-    DDRD |= OUTPUT_MASK;
-
-    // Initial state:
-    // buzzer OFF, RGB OFF, relay OFF/open (active LOW)
-    PORTD &= ~((1 << BUZZER_BIT) |
-               (1 << RGB_R_BIT) |
-               (1 << RGB_G_BIT) |
-               (1 << RGB_B_BIT));
-
-    PORTD |= (1 << RELAY_BIT);
-
-    // D8/D9 as inputs with internal pull-ups
+    // D8, D9 inputs with internal pull-ups
     DDRB &= ~((1 << MUTE_BIT) | (1 << RESET_BIT));
     PORTB |= (1 << MUTE_BIT) | (1 << RESET_BIT);
+
+    // Safe initial output state
+    PORTD &= ~((1 << BUZZER_BIT) |
+               (1 << RED_BIT) |
+               (1 << GREEN_BIT) |
+               (1 << BLUE_BIT));
+
+    // Active-low relay: HIGH releases the relay coil
+    PORTD |= (1 << RELAY_BIT);
 }
 
-bool mute_pressed()
-{
-    return !(PINB & (1 << MUTE_BIT));
+void set_rgb(bool red, bool green, bool blue) {
+    if (red)   PORTD |=  (1 << RED_BIT);
+    else       PORTD &= ~(1 << RED_BIT);
+
+    if (green) PORTD |=  (1 << GREEN_BIT);
+    else       PORTD &= ~(1 << GREEN_BIT);
+
+    if (blue)  PORTD |=  (1 << BLUE_BIT);
+    else       PORTD &= ~(1 << BLUE_BIT);
 }
 
-bool reset_pressed()
-{
-    return !(PINB & (1 << RESET_BIT));
+void set_buzzer(bool enabled) {
+    if (enabled) PORTD |=  (1 << BUZZER_BIT);
+    else         PORTD &= ~(1 << BUZZER_BIT);
 }
 
-void buzzer_set(bool on)
-{
-    if (on && !muted)
-        PORTD |= (1 << BUZZER_BIT);
-    else
-        PORTD &= ~(1 << BUZZER_BIT);
+void set_relay(bool connected) {
+    // Assumes an active-low relay module:
+    // LOW = relay energized; HIGH = relay released.
+    if (connected) PORTD &= ~(1 << RELAY_BIT);
+    else           PORTD |=  (1 << RELAY_BIT);
 }
 
-void rgb_set(bool red, bool green, bool blue)
-{
-    uint8_t mask = (1 << RGB_R_BIT) |
-                   (1 << RGB_G_BIT) |
-                   (1 << RGB_B_BIT);
-
-    uint8_t value = 0;
-
-    if (red)   value |= (1 << RGB_R_BIT);
-    if (green) value |= (1 << RGB_G_BIT);
-    if (blue)  value |= (1 << RGB_B_BIT);
-
-    PORTD = (PORTD & ~mask) | value;
+// ==================== CAN DATA HELPERS ====================
+int16_t read_i16_be(const byte *data) {
+    uint16_t value = ((uint16_t)data[0] << 8) | data[1];
+    return (int16_t)value;
 }
 
-void relay_set(bool closed)
-{
-    // Active-LOW relay:
-    // LOW  = relay energized, contact COM-NO closed
-    // HIGH = relay de-energized, contact COM-NO open
-    if (closed)
-        PORTD &= ~(1 << RELAY_BIT);
-    else
-        PORTD |= (1 << RELAY_BIT);
+uint16_t read_u16_be(const byte *data) {
+    return ((uint16_t)data[0] << 8) | data[1];
 }
 
-// =====================================================
-// CAN decoding helpers
-// =====================================================
-
-uint16_t read_u16_be(const byte *d, uint8_t i)
-{
-    return ((uint16_t)d[i] << 8) | d[i + 1];
-}
-
-int16_t read_i16_be(const byte *d, uint8_t i)
-{
-    uint16_t raw = read_u16_be(d, i);
-    return (int16_t)raw;
-}
-
-void receive_can()
-{
-    if (CAN0.checkReceive() != CAN_MSGAVAIL)
+void receive_can_data() {
+    if (CAN0.checkReceive() != CAN_MSGAVAIL) {
         return;
+    }
 
-    unsigned long id = 0;
+    unsigned long rxId = 0;
     byte len = 0;
     byte data[8] = {0};
 
-    CAN0.readMsgBuf(&id, &len, data);
-
-    if (id == 0x100 && len >= 4)
-    {
-        temp1_x10 = read_i16_be(data, 0);
-        temp2_x10 = read_i16_be(data, 2);
-
-        haveTempData = true;
-        lastTempMs = millis();
-    }
-    else if (id == 0x200 && len >= 6)
-    {
-        voltage_mV = read_u16_be(data, 0);
-        current_mA = read_i16_be(data, 2);
-        power_mW = read_u16_be(data, 4);
-
-        havePowerData = true;
-        lastPowerMs = millis();
-    }
-}
-
-// =====================================================
-// Fault logic
-// =====================================================
-
-bool temp_data_fresh()
-{
-    return haveTempData &&
-           (millis() - lastTempMs <= CAN_TIMEOUT_MS);
-}
-
-bool power_data_fresh()
-{
-    return havePowerData &&
-           (millis() - lastPowerMs <= CAN_TIMEOUT_MS);
-}
-
-bool communication_fault()
-{
-    return !temp_data_fresh() || !power_data_fresh();
-}
-
-bool temperature_warning()
-{
-    return temp1_x10 >= TEMP_WARN_X10 ||
-           temp2_x10 >= TEMP_WARN_X10;
-}
-
-bool temperature_critical()
-{
-    return temp1_x10 >= TEMP_CRIT_X10 ||
-           temp2_x10 >= TEMP_CRIT_X10;
-}
-
-bool current_fault()
-{
-    int32_t i = current_mA;
-
-    if (i < 0)
-        i = -i;
-
-    return i >= CURRENT_LIMIT_MA;
-}
-
-bool voltage_fault()
-{
-    return voltage_mV < VOLTAGE_MIN_MV ||
-           voltage_mV > VOLTAGE_MAX_MV;
-}
-
-bool all_conditions_safe()
-{
-    return temp_data_fresh() &&
-           power_data_fresh() &&
-           !temperature_critical() &&
-           !current_fault() &&
-           !voltage_fault();
-}
-
-void update_buttons()
-{
-    bool muteNow = mute_pressed();
-    bool resetNow = reset_pressed();
-
-    // Toggle mute on button press edge
-    if (muteNow && !lastMuteButton)
-    {
-        muted = !muted;
+    if (CAN0.readMsgBuf(&rxId, &len, data) != CAN_OK) {
+        return;
     }
 
-    // Reset a latched fault only if all data is fresh
-    // and all critical conditions are clear.
-    if (resetNow && !lastResetButton)
-    {
-        if (all_conditions_safe())
-        {
+    if (rxId == CAN_ID_TEMP && len >= 4) {
+        temp1_x10 = read_i16_be(&data[0]);
+        temp2_x10 = read_i16_be(&data[2]);
+
+        lastTempRx = millis();
+        tempDataReceived = true;
+    }
+    else if (rxId == CAN_ID_POWER && len >= 6) {
+        voltage_mV = read_u16_be(&data[0]);
+        current_mA = read_i16_be(&data[2]);
+        power_mW = read_u16_be(&data[4]);
+
+        lastPowerRx = millis();
+        powerDataReceived = true;
+    }
+}
+
+// ==================== SAFETY LOGIC ====================
+bool data_is_fresh() {
+    unsigned long now = millis();
+
+    return tempDataReceived &&
+           powerDataReceived &&
+           (now - lastTempRx <= DATA_TIMEOUT_MS) &&
+           (now - lastPowerRx <= DATA_TIMEOUT_MS);
+}
+
+bool warning_condition() {
+    return tempDataReceived &&
+           (temp1_x10 >= TEMP_WARNING_X10 ||
+            temp2_x10 >= TEMP_WARNING_X10);
+}
+
+bool critical_condition() {
+    if (!data_is_fresh()) {
+        return true;
+    }
+
+    if (temp1_x10 >= TEMP_CRITICAL_X10 ||
+        temp2_x10 >= TEMP_CRITICAL_X10) {
+        return true;
+    }
+
+    if (current_mA > CURRENT_LIMIT_MA ||
+        current_mA < -CURRENT_LIMIT_MA) {
+        return true;
+    }
+
+    if (voltage_mV < VOLTAGE_MIN_MV ||
+        voltage_mV > VOLTAGE_MAX_MV) {
+        return true;
+    }
+
+    return false;
+}
+
+bool all_conditions_safe() {
+    if (!data_is_fresh()) {
+        return false;
+    }
+
+    if (temp1_x10 >= TEMP_WARNING_X10 ||
+        temp2_x10 >= TEMP_WARNING_X10) {
+        return false;
+    }
+
+    if (current_mA > CURRENT_LIMIT_MA ||
+        current_mA < -CURRENT_LIMIT_MA) {
+        return false;
+    }
+
+    if (voltage_mV < VOLTAGE_MIN_MV ||
+        voltage_mV > VOLTAGE_MAX_MV) {
+        return false;
+    }
+
+    return true;
+}
+
+void handle_buttons() {
+    bool mutePressed = !(PINB & (1 << MUTE_BIT));
+    bool resetPressed = !(PINB & (1 << RESET_BIT));
+
+    // Mute buzzer on a new button press
+    if (mutePressed && !previousMutePressed) {
+        buzzerMuted = true;
+        Serial.println(F("[BUTTON] Buzzer muted"));
+    }
+
+    // Reset only if every monitored condition is safe
+    if (resetPressed && !previousResetPressed) {
+        if (all_conditions_safe()) {
             faultLatched = false;
-            muted = false;
+            buzzerMuted = false;
+            Serial.println(F("[BUTTON] Fault reset: conditions safe"));
+        } else {
+            Serial.println(F("[BUTTON] Reset rejected: conditions unsafe"));
         }
     }
 
-    lastMuteButton = muteNow;
-    lastResetButton = resetNow;
+    previousMutePressed = mutePressed;
+    previousResetPressed = resetPressed;
 }
 
-void update_fault_state()
-{
-    // A serious fault latches until manually reset.
-    if (communication_fault() ||
-        temperature_critical() ||
-        current_fault() ||
-        voltage_fault())
-    {
+void update_safety_state() {
+    if (critical_condition()) {
+        if (!faultLatched) {
+            Serial.println(F("[FAULT] Critical condition detected"));
+        }
+
         faultLatched = true;
     }
-
-    // Warning temperature alone does not latch the relay open.
 }
 
-// =====================================================
-// Outputs
-// =====================================================
+void update_outputs() {
+    bool warning = warning_condition();
+    bool critical = faultLatched;
 
-void update_outputs()
-{
-    bool commFault = communication_fault();
-    bool critical = temperature_critical() ||
-                    current_fault() ||
-                    voltage_fault();
-
-    bool warning = temperature_warning();
-
-    // Keep load disconnected while a fault is latched.
-    relay_set(!faultLatched);
-
-    unsigned long now = millis();
-
-    if (now - lastBlinkMs >= BLINK_INTERVAL_MS)
-    {
-        lastBlinkMs = now;
-        blinkState = !blinkState;
+    // Red = latched fault; yellow = warning; green = normal
+    if (critical) {
+        set_rgb(true, false, false);
+    }
+    else if (warning) {
+        set_rgb(true, true, false);
+    }
+    else {
+        set_rgb(false, true, false);
     }
 
-    if (commFault || critical || faultLatched)
-    {
-        // Red blinking for latched fault / critical fault
-        rgb_set(blinkState, false, false);
-        buzzer_set(true);
-    }
-    else if (warning)
-    {
-        // Yellow for temperature warning
-        rgb_set(true, true, false);
-        buzzer_set(false);
-    }
-    else
-    {
-        // Green means normal operation
-        rgb_set(false, true, false);
-        buzzer_set(false);
-    }
+    set_buzzer((critical || warning) && !buzzerMuted);
+
+    // Disconnect the load whenever a fault is latched
+    set_relay(!faultLatched);
 }
 
-// =====================================================
-// LCD
-// =====================================================
-
-void print_temp_value(int16_t value)
-{
-    lcd.print(value / 10);
-    lcd.print('.');
-    int16_t decimal = abs(value % 10);
-    lcd.print(decimal);
+// ==================== SERIAL MONITOR ====================
+void print_temperature(const __FlashStringHelper *label,
+                       int16_t value_x10) {
+    Serial.print(label);
+    Serial.print(value_x10 / 10);
+    Serial.print('.');
+    int16_t fraction = value_x10 % 10;
+    if (fraction < 0) fraction = -fraction;
+    Serial.print(fraction);
+    Serial.println(F(" C"));
 }
 
-void update_lcd()
-{
-    unsigned long now = millis();
+void print_status() {
+    Serial.println();
+    Serial.println(F("========== BATTERY ECU =========="));
 
-    if (now - lastLcdMs < LCD_UPDATE_MS)
-        return;
+    Serial.print(F("CAN temperature node: "));
+    Serial.println(tempDataReceived ? F("DATA RECEIVED") : F("NO DATA"));
 
-    lastLcdMs = now;
-
-    bool commFault = communication_fault();
-    bool critical = temperature_critical() ||
-                    current_fault() ||
-                    voltage_fault();
-
-    lcd.setCursor(0, 0);
-
-    if (commFault)
-    {
-        lcd.print(F("CAN COMM ERROR  "));
-    }
-    else if (faultLatched || critical)
-    {
-        lcd.print(F("FAULT - LOAD OFF"));
-    }
-    else if (temperature_warning())
-    {
-        lcd.print(F("TEMP WARNING    "));
-    }
-    else
-    {
-        lcd.print(F("T1:"));
-        print_temp_value(temp1_x10);
-        lcd.print(F(" T2:"));
-        print_temp_value(temp2_x10);
-        lcd.print(F("C "));
+    if (tempDataReceived) {
+        print_temperature(F("Temperature 1: "), temp1_x10);
+        print_temperature(F("Temperature 2: "), temp2_x10);
     }
 
-    lcd.setCursor(0, 1);
+    Serial.print(F("CAN power node: "));
+    Serial.println(powerDataReceived ? F("DATA RECEIVED") : F("NO DATA"));
 
-    if (!power_data_fresh())
-    {
-        lcd.print(F("Power data lost "));
-    }
-    else
-    {
-        lcd.print(F("V:"));
-        lcd.print(voltage_mV / 1000.0, 1);
-        lcd.print(F(" I:"));
-        lcd.print(current_mA / 1000.0, 2);
-        lcd.print(F("A"));
+    if (powerDataReceived) {
+        Serial.print(F("Voltage: "));
+        Serial.print(voltage_mV / 1000.0, 2);
+        Serial.println(F(" V"));
 
-        // Overwrite any leftover characters
-        lcd.print(F("  "));
+        Serial.print(F("Current: "));
+        Serial.print(current_mA / 1000.0, 3);
+        Serial.println(F(" A"));
+
+        Serial.print(F("Power: "));
+        Serial.print(power_mW / 1000.0, 2);
+        Serial.println(F(" W"));
     }
+
+    Serial.print(F("Warning: "));
+    Serial.println(warning_condition() ? F("YES") : F("NO"));
+
+    Serial.print(F("Fault latched: "));
+    Serial.println(faultLatched ? F("YES") : F("NO"));
+
+    Serial.print(F("Buzzer: "));
+    Serial.println(((faultLatched || warning_condition()) &&
+                    !buzzerMuted) ? F("ON") : F("OFF"));
+
+    Serial.print(F("Relay command: "));
+    Serial.println(faultLatched ? F("DISCONNECT") : F("CONNECT"));
+
+    if (!data_is_fresh()) {
+        Serial.println(F("[WARNING] Missing or stale CAN data"));
+    }
+
+    Serial.println(F("================================="));
 }
 
-// =====================================================
-// Setup and main loop
-// =====================================================
-
-void setup()
-{
+// ==================== SETUP ====================
+void setup() {
     gpio_init();
 
+    Serial.begin(9600);
     SPI.begin();
-    Wire.begin();
 
-    lcd.init();
-    lcd.backlight();
-    lcd.clear();
+    // Keep SPI master mode enabled and CS inactive before init
+    pinMode(CAN_CS, OUTPUT);
+    digitalWrite(CAN_CS, HIGH);
 
-    lcd.setCursor(0, 0);
-    lcd.print(F("Battery ECU"));
-    lcd.setCursor(0, 1);
-    lcd.print(F("Starting CAN..."));
+    Serial.println();
+    Serial.println(F("Battery Safety ECU starting..."));
+    Serial.println(F("MCP2515 clock: 8 MHz"));
+    Serial.println(F("CAN bitrate: 500 kbps"));
 
-    // Initialize CAN at 500 kbps, MCP2515 crystal 16 MHz.
-    while (CAN0.begin(MCP_ANY, CAN_500KBPS, MCP_16MHZ) != CAN_OK)
-    {
-        lcd.setCursor(0, 1);
-        lcd.print(F("MCP2515 ERROR   "));
-        delay(500);
+    while (CAN0.begin(MCP_ANY, CAN_BITRATE, CAN_CLOCK) != CAN_OK) {
+        Serial.println(F("[ERROR] MCP2515 init failed. Check SPI, power and clock."));
+        delay(1000);
     }
 
     CAN0.setMode(MCP_NORMAL);
 
-    // Keep relay open until both data streams are valid.
-    relay_set(false);
-    buzzer_set(false);
-    rgb_set(false, false, true);
-
-    delay(500);
-    lcd.clear();
+    Serial.println(F("[OK] MCP2515 initialized"));
+    Serial.println(F("[OK] CAN normal mode"));
+    Serial.println(F("Waiting for CAN IDs 0x100 and 0x200..."));
+    Serial.println(F("Serial Monitor: 9600 baud"));
 }
 
-void loop()
-{
-    receive_can();
-    update_buttons();
-    update_fault_state();
+// ==================== MAIN LOOP ====================
+void loop() {
+    receive_can_data();
+    handle_buttons();
+    update_safety_state();
     update_outputs();
-    update_lcd();
+
+    unsigned long now = millis();
+
+    if (now - lastPrint >= PRINT_INTERVAL_MS) {
+        lastPrint = now;
+        print_status();
+    }
 }

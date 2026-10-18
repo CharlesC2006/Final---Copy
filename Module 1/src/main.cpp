@@ -71,7 +71,7 @@ void setup()
     Serial.begin(9600);
     adc_init_avr();
 
-    while (CAN0.begin(MCP_ANY, CAN_500KBPS, MCP_16MHZ) != CAN_OK) {
+    while (CAN0.begin(MCP_ANY, CAN_500KBPS, MCP_8MHZ) != CAN_OK) {
         Serial.println(F("MCP2515 init error"));
         delay(500);
     }
